@@ -1,28 +1,37 @@
 """
 Garmin Connect API Proxy for Railway
 =====================================
-Mini FastAPI app that authenticates with Garmin via garth and exposes
-REST endpoints for the coaching skill to consume.
+Mini FastAPI app that serves Garmin Connect data via REST endpoints.
 
-Tokens are stored in a persistent Railway volume (TOKEN_DIR env var).
-Login is ONLY triggered manually via /admin/login to avoid rate limiting.
+CRITICAL ARCHITECTURE NOTE:
+Garmin blocks login attempts from Railway IPs (permanent 429 rate limit).
+Therefore, this proxy NEVER calls garth.login(). Instead:
 
-Deploy to Railway with env vars:
-  GARMIN_EMAIL    - Garmin Connect email
-  GARMIN_PASSWORD - Garmin Connect password
-  API_KEY         - Secret key to protect endpoints
-  TOKEN_DIR       - Persistent path for garth tokens (default: /data/garmin_tokens)
+  1. Run scripts/generate_tokens.py LOCALLY on a Mac/PC to get OAuth tokens
+  2. Paste the resulting GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN JSON
+     strings into Railway env vars
+  3. On startup, the proxy writes those JSON strings to disk and resumes
+     the session via garth.resume()
+  4. garth auto-refreshes access_token (25h lifetime). The refresh_token
+     lasts ~30 days, after which you re-run generate_tokens.py locally
+     and update the env vars.
+
+Env vars (Railway):
+  API_KEY              - Secret key to protect endpoints
+  GARMIN_OAUTH1_TOKEN  - JSON string of oauth1_token (from generate_tokens.py)
+  GARMIN_OAUTH2_TOKEN  - JSON string of oauth2_token (from generate_tokens.py)
+  TOKEN_DIR            - Where to write tokens on disk (default: /tmp/garmin_tokens)
 
 Endpoints:
   GET  /health                    - Health check (no auth)
   GET  /admin/session-status      - Check if tokens are valid (API key)
-  POST /admin/login               - Force fresh Garmin login (API key) - USE SPARINGLY
   GET  /activities/latest         - Most recent activity with full details
   GET  /activities?start=&end=    - Activities in date range
   GET  /daily-metrics?date=       - HRV, sleep, RHR, body battery for a date
 """
 
 import os
+import json
 import logging
 from datetime import date
 from pathlib import Path
@@ -31,17 +40,16 @@ import garth
 from fastapi import FastAPI, HTTPException, Header, Query
 
 # --- Config ---
-GARMIN_EMAIL = os.environ.get("GARMIN_EMAIL")
-GARMIN_PASSWORD = os.environ.get("GARMIN_PASSWORD")
 API_KEY = os.environ.get("API_KEY", "change-me")
-TOKEN_DIR = os.environ.get("TOKEN_DIR", "/data/garmin_tokens")
+TOKEN_DIR = os.environ.get("TOKEN_DIR", "/tmp/garmin_tokens")
+GARMIN_OAUTH1_TOKEN = os.environ.get("GARMIN_OAUTH1_TOKEN")
+GARMIN_OAUTH2_TOKEN = os.environ.get("GARMIN_OAUTH2_TOKEN")
 
-# Ensure token dir exists
-Path(TOKEN_DIR).mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="Garmin Proxy", version="2.0")
+app = FastAPI(title="Garmin Proxy", version="3.0")
 logger = logging.getLogger("garmin-proxy")
 logging.basicConfig(level=logging.INFO)
+
+_session_initialized = False
 
 
 # --- Auth ---
@@ -51,20 +59,72 @@ def require_api_key(x_api_key: str = Header(None)):
         raise HTTPException(401, "Invalid or missing API key")
 
 
-def ensure_session():
-    """Resume garth session from persistent tokens. DOES NOT login automatically."""
-    try:
-        garth.resume(TOKEN_DIR)
-        # Verify the session still works
-        garth.connectapi("/userprofile-service/usersettings")
-        logger.info("Resumed existing Garmin session")
-    except Exception as e:
-        logger.error(f"Session resume failed: {e}")
-        raise HTTPException(
-            503,
-            "No valid Garmin session. Call POST /admin/login once to authenticate. "
-            f"Reason: {type(e).__name__}"
+def _write_tokens_from_env():
+    """Write the OAuth tokens from env vars to TOKEN_DIR on disk."""
+    if not GARMIN_OAUTH1_TOKEN or not GARMIN_OAUTH2_TOKEN:
+        raise RuntimeError(
+            "GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN env vars must be set. "
+            "Generate them locally with scripts/generate_tokens.py."
         )
+
+    # Validate the JSON so we fail fast with a clear error
+    try:
+        json.loads(GARMIN_OAUTH1_TOKEN)
+        json.loads(GARMIN_OAUTH2_TOKEN)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"OAuth token env var is not valid JSON: {e}")
+
+    Path(TOKEN_DIR).mkdir(parents=True, exist_ok=True)
+    (Path(TOKEN_DIR) / "oauth1_token.json").write_text(GARMIN_OAUTH1_TOKEN)
+    (Path(TOKEN_DIR) / "oauth2_token.json").write_text(GARMIN_OAUTH2_TOKEN)
+    logger.info(f"Wrote OAuth tokens from env vars to {TOKEN_DIR}")
+
+
+def ensure_session():
+    """
+    Make sure there is a usable garth session. NEVER calls garth.login().
+    On the first request after startup we write the env-var tokens to disk
+    and resume the session. On subsequent requests we only re-resume if the
+    last call failed.
+    """
+    global _session_initialized
+
+    if not _session_initialized:
+        try:
+            _write_tokens_from_env()
+            garth.resume(TOKEN_DIR)
+            # Sanity check
+            garth.connectapi("/userprofile-service/usersettings")
+            _session_initialized = True
+            logger.info("Garmin session initialized from env-var tokens")
+            return
+        except Exception as e:
+            logger.error(f"Session init failed: {type(e).__name__}: {e}")
+            raise HTTPException(
+                503,
+                f"Garmin session init failed: {type(e).__name__}: {e}. "
+                "Check that GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN "
+                "are set correctly in Railway."
+            )
+
+    # Already initialized - try a cheap call; if it fails, re-resume once.
+    try:
+        garth.connectapi("/userprofile-service/usersettings")
+    except Exception as e:
+        logger.warning(f"Session check failed, re-resuming: {e}")
+        try:
+            garth.resume(TOKEN_DIR)
+            garth.connectapi("/userprofile-service/usersettings")
+        except Exception as e2:
+            logger.error(f"Re-resume failed: {e2}")
+            _session_initialized = False
+            raise HTTPException(
+                503,
+                f"Garmin session lost and could not be recovered: "
+                f"{type(e2).__name__}: {e2}. The refresh_token may have "
+                "expired - re-run scripts/generate_tokens.py locally and "
+                "update the Railway env vars."
+            )
 
 
 # --- Helpers ---
@@ -110,63 +170,48 @@ def parse_activity(raw: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "garmin-proxy", "version": "2.0"}
+    return {"status": "ok", "service": "garmin-proxy", "version": "3.0"}
 
 
 # --- Admin Endpoints ---
 
 @app.get("/admin/session-status")
 def session_status(x_api_key: str = Header(None)):
-    """Check if the current saved tokens work."""
-    require_api_key(x_api_key)
-    try:
-        garth.resume(TOKEN_DIR)
-        profile = garth.connectapi("/userprofile-service/usersettings")
-        return {
-            "authenticated": True,
-            "token_dir": TOKEN_DIR,
-            "token_files": [f.name for f in Path(TOKEN_DIR).iterdir() if f.is_file()],
-        }
-    except Exception as e:
-        return {
-            "authenticated": False,
-            "token_dir": TOKEN_DIR,
-            "token_files": [f.name for f in Path(TOKEN_DIR).iterdir() if f.is_file()] if Path(TOKEN_DIR).exists() else [],
-            "error": f"{type(e).__name__}: {e}",
-        }
-
-
-@app.post("/admin/login")
-def admin_login(x_api_key: str = Header(None)):
-    """
-    Force a fresh Garmin login and save tokens to persistent volume.
-    Call this ONCE after deploying or if tokens expire. Do NOT call repeatedly
-    or Garmin will rate-limit the account.
-    """
+    """Check if env-var tokens are present and working."""
     require_api_key(x_api_key)
 
-    if not GARMIN_EMAIL or not GARMIN_PASSWORD:
-        raise HTTPException(500, "GARMIN_EMAIL and GARMIN_PASSWORD env vars must be set")
+    has_oauth1 = bool(GARMIN_OAUTH1_TOKEN)
+    has_oauth2 = bool(GARMIN_OAUTH2_TOKEN)
+
+    result = {
+        "version": "3.0",
+        "token_dir": TOKEN_DIR,
+        "env_var_oauth1_present": has_oauth1,
+        "env_var_oauth2_present": has_oauth2,
+    }
+
+    if not (has_oauth1 and has_oauth2):
+        result["authenticated"] = False
+        result["error"] = "Missing GARMIN_OAUTH1_TOKEN or GARMIN_OAUTH2_TOKEN env var"
+        return result
 
     try:
-        logger.info("Attempting fresh Garmin login...")
-        garth.login(GARMIN_EMAIL, GARMIN_PASSWORD)
-        garth.save(TOKEN_DIR)
-        logger.info(f"Login successful, tokens saved to {TOKEN_DIR}")
-
-        # Verify
+        _write_tokens_from_env()
         garth.resume(TOKEN_DIR)
         garth.connectapi("/userprofile-service/usersettings")
-
-        return {
-            "success": True,
-            "message": "Login successful, tokens saved",
-            "token_dir": TOKEN_DIR,
-            "token_files": [f.name for f in Path(TOKEN_DIR).iterdir() if f.is_file()],
-        }
+        result["authenticated"] = True
+        result["token_files"] = [
+            f.name for f in Path(TOKEN_DIR).iterdir() if f.is_file()
+        ]
+        return result
     except Exception as e:
-        logger.error(f"Login failed: {e}")
-        raise HTTPException(500, f"Login failed: {type(e).__name__}: {e}")
+        result["authenticated"] = False
+        result["error"] = f"{type(e).__name__}: {e}"
+        if Path(TOKEN_DIR).exists():
+            result["token_files"] = [
+                f.name for f in Path(TOKEN_DIR).iterdir() if f.is_file()
+            ]
+        return result
 
 
 # --- Garmin Data Endpoints ---
