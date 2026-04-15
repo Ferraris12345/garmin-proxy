@@ -508,6 +508,23 @@ def get_daily_metrics(
     return metrics
 
 
+@app.get("/workouts")
+def list_workouts(limit: int = Query(10), x_api_key: str = Header(None)):
+    """List structured workouts saved in Garmin Connect."""
+    require_api_key(x_api_key)
+    ensure_session()
+    try:
+        resp = garth.connectapi("/workout-service/workouts",
+                                params={"start": 0, "limit": limit})
+        if isinstance(resp, list):
+            return [{"workoutId": w.get("workoutId"), "workoutName": w.get("workoutName"),
+                     "sportType": (w.get("sportType") or {}).get("sportTypeKey"),
+                     "updatedDate": w.get("updatedDate")} for w in resp]
+        return resp
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/workouts")
 def create_workout(workout: dict, x_api_key: str = Header(None)):
     """
