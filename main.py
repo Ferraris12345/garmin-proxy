@@ -514,8 +514,10 @@ def list_workouts(limit: int = Query(10), x_api_key: str = Header(None)):
     require_api_key(x_api_key)
     ensure_session()
     try:
-        resp = garth.connectapi("/workout-service/workouts",
-                                params={"start": 0, "limit": limit})
+        resp = garth.client.request(
+            "GET", "connect", "/proxy/workout-service/workouts",
+            api=True, params={"start": 0, "limit": limit},
+        ).json()
         if isinstance(resp, list):
             return [{"workoutId": w.get("workoutId"), "workoutName": w.get("workoutName"),
                      "sportType": (w.get("sportType") or {}).get("sportTypeKey"),
@@ -544,20 +546,21 @@ def create_workout(workout: dict, x_api_key: str = Header(None)):
     ensure_session()
 
     try:
-        resp = garth.connectapi(
-            "/workout-service/workout",
-            method="POST",
-            json=workout,
+        # connect.garmin.com/proxy/ is the correct host for workout mutations
+        resp = garth.client.request(
+            "POST", "connect", "/proxy/workout-service/workout",
+            api=True, json=workout,
         )
-        if resp and isinstance(resp, dict):
-            wid = resp.get("workoutId") or resp.get("id")
+        data = resp.json() if resp.text else {}
+        if isinstance(data, dict):
+            wid = data.get("workoutId") or data.get("id")
             return {
                 "status": "created",
                 "workoutId": wid,
-                "workoutName": resp.get("workoutName", workout.get("workoutName")),
-                "raw": resp,
+                "workoutName": data.get("workoutName", workout.get("workoutName")),
+                "raw": data,
             }
-        return {"status": "unknown_response", "raw": resp}
+        return {"status": "unknown_response", "raw": data}
     except Exception as e:
         logger.error(f"Error creating workout: {e}")
         raise HTTPException(500, str(e))
