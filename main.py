@@ -508,6 +508,44 @@ def get_daily_metrics(
     return metrics
 
 
+@app.post("/workouts")
+def create_workout(workout: dict, x_api_key: str = Header(None)):
+    """
+    Create a structured workout in Garmin Connect.
+
+    POST a Garmin workout JSON directly — same format used by the Connect web app.
+    On success returns the workoutId assigned by Garmin.
+
+    Example body:
+        {
+          "workoutName": "5x1K Z4",
+          "sportType": {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
+          "workoutSegments": [{"segmentOrder": 1, "sportType": {...}, "workoutSteps": [...]}]
+        }
+    """
+    require_api_key(x_api_key)
+    ensure_session()
+
+    try:
+        resp = garth.connectapi(
+            "/workout-service/workout",
+            method="POST",
+            json=workout,
+        )
+        if resp and isinstance(resp, dict):
+            wid = resp.get("workoutId") or resp.get("id")
+            return {
+                "status": "created",
+                "workoutId": wid,
+                "workoutName": resp.get("workoutName", workout.get("workoutName")),
+                "raw": resp,
+            }
+        return {"status": "unknown_response", "raw": resp}
+    except Exception as e:
+        logger.error(f"Error creating workout: {e}")
+        raise HTTPException(500, str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
